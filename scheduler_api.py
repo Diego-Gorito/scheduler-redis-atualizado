@@ -1,208 +1,313 @@
-import json
 import os
-from datetime import datetime
-from typing import Dict, Any
+import json
 import redis
+import logging
 import requests
-from fastapi import FastAPI, HTTPException, Depends, Header
+from datetime import datetime
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-import uvicorn
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 import pytz
 
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Carrega variáveis de ambiente
 load_dotenv()
 
-app = FastAPI(title="Scheduler API", version="1.0.0")
+# Configurações
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+API_TOKEN = os.getenv("API_TOKEN", "your-secret-token-here")
+API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_PORT = int(os.getenv("API_PORT", "8000"))
 
-API_TOKEN = os.getenv('API_TOKEN')
+# Inicializa FastAPI
+app = FastAPI(title="Scheduler API", version="1.2.0")
+security = HTTPBearer()
 
-def verify_token(authorization: str = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization format")
-    
-    token = authorization.replace("Bearer ", "")
-    if token != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    
-    return token
-
+# Inicializa Redis
 redis_client = redis.Redis(
-    host=os.getenv('REDIS_HOST', 'localhost'),
-    port=int(os.getenv('REDIS_PORT', 6379)),
-    password=os.getenv('REDIS_PASSWORD'),
+    host=REDIS_HOST, 
+    port=REDIS_PORT, 
+    db=0, 
     decode_responses=True
 )
 
-# Usar APScheduler ao invés de schedule
+# Inicializa APScheduler
 scheduler = BackgroundScheduler(timezone=pytz.UTC)
 scheduler.start()
+logger.info("APScheduler iniciado")
 
+# Modelos Pydantic
 class ScheduleMessage(BaseModel):
     id: str
     scheduleTo: str
-    payload: Dict[str, Any]
+    payload: dict
     webhookUrl: str
 
-def fire_webhook(message_id: str, webhook_url: str, payload: Dict[str, Any]):
-    try:
-        response = requests.post(webhook_url, json=payload, timeout=30)
-        response.raise_for_status()
-        print(f"[{datetime.now().isoformat()}] Webhook fired successfully for message {message_id}")
-    except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Failed to fire webhook for message {message_id}: {e}")
-    finally:
-        redis_client.delete(f"message:{message_id}")
-        print(f"[{datetime.now().isoformat()}] Message {message_id} cleaned from Redis")
+class MessageResponse(BaseModel):
+    status: str
+    messageId: str
 
-def schedule_message(message_id: str, schedule_timestamp: str, webhook_url: str, payload: Dict[str, Any]):
-    # Parse da data ISO com timezone
-    schedule_time = datetime.fromisoformat(schedule_timestamp.replace('Z', '+00:00'))
-    current_time = datetime.now(pytz.UTC)
-    
-    # Se a data já passou, executa imediatamente
-    if schedule_time <= current_time:
-        print(f"[{datetime.now().isoformat()}] Schedule time in the past, firing immediately - ID: {message_id}")
-        fire_webhook(message_id, webhook_url, payload)
-        return
-    
-    # Agenda para a data específica usando APScheduler
-    try:
-        scheduler.add_job(
-            fire_webhook,
-            trigger=DateTrigger(run_date=schedule_time),
-            args=[message_id, webhook_url, payload],
-            id=message_id,
-            replace_existing=True
+# Autenticação
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if credentials.credentials != API_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido"
         )
-        print(f"[{datetime.now().isoformat()}] Job scheduled for {schedule_time.isoformat()} - ID: {message_id}")
-    except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Failed to schedule job - ID: {message_id}, Error: {e}")
-        raise
+    return credentials.credentials
 
-def restore_scheduled_messages():
+# Função para enviar webhook
+def send_webhook(message_id: str, payload: dict, webhook_url: str):
+    """Envia o webhook e remove a mensagem do Redis"""
+    try:
+        logger.info(f"Enviando webhook para {webhook_url} com messageId: {message_id}")
+        
+        # Envia o webhook
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        
+        logger.info(f"Webhook enviado. Status: {response.status_code}")
+        
+        # Remove a mensagem do Redis após envio bem-sucedido
+        redis_client.delete(f"message:{message_id}")
+        logger.info(f"Mensagem {message_id} removida do Redis")
+        
+    except Exception as e:
+        logger.error(f"Erro ao enviar webhook para {webhook_url}: {str(e)}")
+        # Mantém a mensagem no Redis em caso de erro
+        redis_client.setex(
+            f"message:{message_id}:error",
+            3600,  # 1 hora
+            str(e)
+        )
+
+# Função para agendar mensagem
+def schedule_message_job(message_id: str, schedule_to: str, payload: dict, webhook_url: str):
+    """Agenda uma mensagem usando APScheduler"""
+    try:
+        # Parse da data
+        schedule_datetime = datetime.fromisoformat(schedule_to.replace('Z', '+00:00'))
+        
+        # Cria o trigger de data
+        trigger = DateTrigger(run_date=schedule_datetime)
+        
+        # Adiciona o job ao scheduler
+        job = scheduler.add_job(
+            send_webhook,
+            trigger=trigger,
+            args=[message_id, payload, webhook_url],
+            id=message_id,
+            replace_existing=True  # IMPORTANTE: substitui job existente com mesmo ID
+        )
+        
+        logger.info(f"Job agendado: {message_id} para {schedule_datetime}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Erro ao agendar mensagem {message_id}: {str(e)}")
+        return False
+
+# Função para restaurar mensagens ao iniciar
+def restore_messages_from_redis():
+    """Restaura todas as mensagens do Redis ao iniciar o servidor"""
     try:
         keys = redis_client.keys("message:*")
-        restored_count = 0
         
-        for key in keys:
+        # Filtra apenas as chaves de mensagens (não as de erro)
+        message_keys = [k for k in keys if not k.endswith(":error")]
+        
+        logger.info(f"Restaurando {len(message_keys)} mensagens do Redis")
+        
+        for key in message_keys:
             try:
-                message_data = json.loads(redis_client.get(key))
-                message_id = message_data["id"]
-                schedule_to = message_data["scheduleTo"]
-                webhook_url = message_data["webhookUrl"]
-                payload = message_data["payload"]
-                
-                schedule_message(message_id, schedule_to, webhook_url, payload)
-                restored_count += 1
-                print(f"[{datetime.now().isoformat()}] Restored scheduled message - ID: {message_id}")
-                
+                message_data = redis_client.get(key)
+                if message_data:
+                    message = json.loads(message_data)
+                    schedule_message_job(
+                        message["id"],
+                        message["scheduleTo"],
+                        message["payload"],
+                        message["webhookUrl"]
+                    )
             except Exception as e:
-                print(f"[{datetime.now().isoformat()}] Failed to restore message {key}: {e}")
+                logger.error(f"Erro ao restaurar mensagem {key}: {str(e)}")
         
-        print(f"[{datetime.now().isoformat()}] Restored {restored_count} scheduled messages from Redis")
+        logger.info("Restauração de mensagens concluída")
         
     except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Error restoring messages: {e}")
+        logger.error(f"Erro ao restaurar mensagens: {str(e)}")
 
-restore_scheduled_messages()
-
-@app.post("/messages")
-async def create_scheduled_message(message: ScheduleMessage, token: str = Depends(verify_token)):
-    try:
-        redis_key = f"message:{message.id}"
-        
-        if redis_client.exists(redis_key):
-            print(f"[{datetime.now().isoformat()}] Message already exists in Redis - ID: {message.id}")
-            raise HTTPException(status_code=409, detail="Message with this ID already exists")
-        
-        message_data = {
-            "id": message.id,
-            "scheduleTo": message.scheduleTo,
-            "payload": message.payload,
-            "webhookUrl": message.webhookUrl
-        }
-        
-        redis_client.set(redis_key, json.dumps(message_data))
-        print(f"[{datetime.now().isoformat()}] Message inserted to Redis - ID: {message.id}")
-        
-        schedule_message(message.id, message.scheduleTo, message.webhookUrl, message.payload)
-        
-        return {"status": "scheduled", "messageId": message.id}
-    
-    except HTTPException as http_exc:
-        print(f"[{datetime.now().isoformat()}] HTTPException in create: {http_exc.status_code} - {http_exc.detail}")
-        raise
-    except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Unexpected exception in create: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to schedule message: {str(e)}")
-
-@app.delete("/messages/{message_id}")
-async def delete_scheduled_message(message_id: str, token: str = Depends(verify_token)):
-    try:
-        redis_key = f"message:{message_id}"
-        
-        if not redis_client.exists(redis_key):
-            print(f"[{datetime.now().isoformat()}] Message not found in Redis - ID: {message_id}")
-            raise HTTPException(status_code=404, detail="Message not found")
-        
-        redis_client.delete(redis_key)
-        
-        # Remove o job do APScheduler
-        try:
-            scheduler.remove_job(message_id)
-            print(f"[{datetime.now().isoformat()}] Job removed from scheduler - ID: {message_id}")
-        except Exception as e:
-            print(f"[{datetime.now().isoformat()}] Job not found in scheduler (may have already run) - ID: {message_id}")
-        
-        return {"status": "deleted", "messageId": message_id}
-    
-    except HTTPException as http_exc:
-        print(f"[{datetime.now().isoformat()}] HTTPException in delete: {http_exc.status_code} - {http_exc.detail}")
-        raise
-    except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Unexpected exception in delete: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete message: {str(e)}")
-
-@app.get("/messages")
-async def list_scheduled_messages(token: str = Depends(verify_token)):
-    try:
-        jobs = []
-        for job in scheduler.get_jobs():
-            jobs.append({
-                "messageId": job.id,
-                "nextRun": job.next_run_time.isoformat() if job.next_run_time else None,
-                "trigger": str(job.trigger)
-            })
-        
-        return {"scheduledJobs": jobs, "count": len(jobs)}
-    
-    except Exception as e:
-        print(f"[{datetime.now().isoformat()}] Error listing jobs: {type(e).__name__}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to list jobs: {str(e)}")
+# Endpoints da API
+@app.on_event("startup")
+async def startup_event():
+    """Restaura mensagens ao iniciar"""
+    restore_messages_from_redis()
 
 @app.get("/health")
 async def health_check():
+    """Verifica a saúde do serviço"""
     try:
         redis_client.ping()
-        scheduler_status = "running" if scheduler.running else "stopped"
-        return {
-            "status": "healthy",
-            "redis": "connected",
-            "scheduler": scheduler_status,
-            "scheduled_jobs": len(scheduler.get_jobs())
-        }
+        redis_status = "connected"
+    except:
+        redis_status = "disconnected"
+    
+    return {
+        "status": "healthy",
+        "redis": redis_status,
+        "scheduler": "running" if scheduler.running else "stopped",
+        "scheduled_jobs": len(scheduler.get_jobs())
+    }
+
+@app.post("/messages", response_model=MessageResponse)
+async def create_message(
+    message: ScheduleMessage,
+    token: str = Depends(verify_token)
+):
+    """
+    Cria ou atualiza uma mensagem agendada.
+    Se o ID já existir, remove o agendamento anterior e cria um novo.
+    """
+    try:
+        message_key = f"message:{message.id}"
+        
+        # Verifica se a mensagem já existe
+        existing_message = redis_client.get(message_key)
+        
+        if existing_message:
+            logger.info(f"Mensagem {message.id} já existe. Atualizando...")
+            
+            # Remove o job antigo do scheduler
+            try:
+                scheduler.remove_job(message.id)
+                logger.info(f"Job antigo {message.id} removido do scheduler")
+            except Exception as e:
+                logger.warning(f"Job {message.id} não encontrado no scheduler: {str(e)}")
+            
+            # Remove a mensagem antiga do Redis
+            redis_client.delete(message_key)
+            logger.info(f"Mensagem antiga {message.id} removida do Redis")
+        
+        # Salva a nova mensagem no Redis
+        message_data = message.dict()
+        redis_client.set(message_key, json.dumps(message_data))
+        logger.info(f"Nova mensagem {message.id} salva no Redis")
+        
+        # Agenda o novo job
+        success = schedule_message_job(
+            message.id,
+            message.scheduleTo,
+            message.payload,
+            message.webhookUrl
+        )
+        
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Erro ao agendar mensagem"
+            )
+        
+        status_msg = "updated" if existing_message else "scheduled"
+        
+        return MessageResponse(
+            status=status_msg,
+            messageId=message.id
+        )
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"status": "unhealthy", "redis": "disconnected", "error": str(e)}
+        logger.error(f"Erro ao processar mensagem: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
-@app.on_event("shutdown")
-def shutdown_event():
-    scheduler.shutdown()
+@app.get("/messages")
+async def list_messages(token: str = Depends(verify_token)):
+    """Lista todas as mensagens agendadas"""
+    try:
+        jobs = scheduler.get_jobs()
+        
+        scheduled_jobs = []
+        for job in jobs:
+            scheduled_jobs.append({
+                "messageId": job.id,
+                "nextRun": str(job.next_run_time),
+                "trigger": str(job.trigger)
+            })
+        
+        return {
+            "scheduledJobs": scheduled_jobs,
+            "count": len(scheduled_jobs)
+        }
+        
+    except Exception as e:
+        logger.error(f"Erro ao listar mensagens: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
+@app.delete("/messages/{message_id}", response_model=MessageResponse)
+async def delete_message(
+    message_id: str,
+    token: str = Depends(verify_token)
+):
+    """Remove uma mensagem agendada"""
+    try:
+        message_key = f"message:{message_id}"
+        
+        # Verifica se a mensagem existe no Redis
+        if not redis_client.exists(message_key):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Mensagem {message_id} não encontrada"
+            )
+        
+        # Remove do scheduler
+        try:
+            scheduler.remove_job(message_id)
+            logger.info(f"Job {message_id} removido do scheduler")
+        except Exception as e:
+            logger.warning(f"Job {message_id} não encontrado no scheduler: {str(e)}")
+        
+        # Remove do Redis
+        redis_client.delete(message_key)
+        logger.info(f"Mensagem {message_id} removida do Redis")
+        
+        return MessageResponse(
+            status="deleted",
+            messageId=message_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erro ao deletar mensagem: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+# Execução
 if __name__ == "__main__":
-    print(f"[{datetime.now().isoformat()}] Starting Scheduler API server")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import uvicorn
+    
+    logger.info(f"Iniciando servidor em {API_HOST}:{API_PORT}")
+    uvicorn.run(app, host=API_HOST, port=API_PORT)
